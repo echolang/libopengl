@@ -1,0 +1,396 @@
+/**
+ * GL / C declarators to Echo types.
+ *
+ * A `<param>` / `<proto>` is prefix + optional `<ptype>` + mid + `<name>` +
+ * suffix. Stars live in prefix/mid; `[N]` in the suffix decays to a pointer,
+ * the way C does at a parameter. Interior consts are dropped (ABI-identical);
+ * the base const is kept, so `const GLchar *const*` is `ptr<ptr<const uint8>>`.
+ */
+
+namespace glgen::types;
+
+use glgen::Error;
+
+public struct Pieces
+{
+    public string $prefix;
+    public string $ptype;
+    public string $mid;
+    public string $suffix;
+    public string $name;
+
+    public constructor()
+    {
+        $this->prefix = '';
+        $this->ptype = '';
+        $this->mid = '';
+        $this->suffix = '';
+        $this->name = '';
+    }
+}
+
+public struct CDecl
+{
+    public string $base;
+    public bool $baseConst;
+    public int32 $stars;
+    public string $name;
+
+    public constructor()
+    {
+        $this->base = '';
+        $this->baseConst = false;
+        $this->stars = 0;
+        $this->name = '';
+    }
+}
+
+public function fromPieces(const Pieces& $p) : result<CDecl, Error>
+{
+    string $text = $p->prefix;
+    $text->append($p->ptype);
+    $text->append($p->mid);
+    $text->append($p->suffix);
+
+    CDecl $d = guard parse($text) else ($e) {
+        return .error($e);
+    }
+
+    $d->name = str::trim($p->name);
+
+    return .ok($d);
+}
+
+/**
+ * Echo type of `$d`. `$asReturn` is what lets a 0-star `void` be `void`
+ * rather than an error. `$where` is the command name, for the diagnostic.
+ */
+public function echoType(const CDecl& $d, bool $asReturn, const string& $where) : result<string, Error>
+{
+    if ($d->stars == 0) {
+        if ($d->base == 'void' || $d->base == 'GLvoid') {
+            if ($asReturn) {
+                return .ok('void');
+            }
+
+            return .error(.voidParam($where));
+        }
+
+        return scalarEchoType($d->base, $where);
+    }
+
+    $inner = '';
+
+    if ($d->base == 'void' || $d->base == 'GLvoid') {
+        $inner = 'uint8';
+    } else {
+        $s = guard scalarEchoType($d->base, $where) else ($e) {
+            return .error($e);
+        }
+
+        $inner = $s;
+    }
+
+    if ($d->baseConst) {
+        if (!$inner->starts('const ') && !$inner->starts('ptr<') && !$inner->starts('extern ')) {
+            $inner = "const {$inner}";
+        }
+    }
+
+    int32 $n = $d->stars;
+
+    while ($n > 0) {
+        $inner = "ptr<{$inner}>";
+        $n = $n - 1;
+    }
+
+    return .ok($inner);
+}
+
+public function parse(const string& $text) : result<CDecl, Error>
+{
+    $s = str::trim($text);
+    usize $i = 0;
+    $d = CDecl();
+    $sawStar = false;
+
+    skipSpaces($s, $i);
+
+    while (atKeyword($s, $i, 'const')) {
+        $d->baseConst = true;
+        $i = $i + 5;
+        skipSpaces($s, $i);
+    }
+
+    if (atKeyword($s, $i, 'struct')) {
+        $i = $i + 6;
+        skipSpaces($s, $i);
+        $ident = takeIdent($s, $i);
+
+        if ($ident->empty()) {
+            return .error(.missingStructName($s));
+        }
+
+        $d->base = "struct {$ident}";
+    } else {
+        $d->base = takeIdent($s, $i);
+
+        if ($d->base->empty()) {
+            return .error(.missingTypeName($s));
+        }
+    }
+
+    while (true) {
+        skipSpaces($s, $i);
+
+        if ($i >= $s->size()) {
+            break;
+        }
+
+        if (atKeyword($s, $i, 'const')) {
+            if (!$sawStar) {
+                $d->baseConst = true;
+            }
+
+            $i = $i + 5;
+            continue;
+        }
+
+        uint8 $b = $s->byte($i);
+
+        if ($b == 42) {
+            $sawStar = true;
+            $d->stars = $d->stars + 1;
+            $i = $i + 1;
+            continue;
+        }
+
+        if ($b == 91) {
+            $sawStar = true;
+            $d->stars = $d->stars + 1;
+            $i = $i + 1;
+
+            while ($i < $s->size() && $s->byte($i) != 93) {
+                $i = $i + 1;
+            }
+
+            if ($i >= $s->size()) {
+                return .error(.unterminatedArray($s));
+            }
+
+            $i = $i + 1;
+            continue;
+        }
+
+        break;
+    }
+
+    return .ok($d);
+}
+
+private function scalarEchoType(const string& $base, const string& $where) : result<string, Error>
+{
+    if ($base == 'GLenum' || $base == 'GLbitfield' || $base == 'GLuint') {
+        return .ok('uint32');
+    }
+
+    if ($base == 'GLint' || $base == 'GLsizei' || $base == 'GLfixed' || $base == 'GLclampx') {
+        return .ok('int32');
+    }
+
+    if ($base == 'GLboolean' || $base == 'GLubyte' || $base == 'GLchar' || $base == 'GLcharARB') {
+        return .ok('uint8');
+    }
+
+    if ($base == 'GLbyte') {
+        return .ok('int8');
+    }
+
+    if ($base == 'GLshort') {
+        return .ok('int16');
+    }
+
+    if ($base == 'GLushort' || $base == 'GLhalf' || $base == 'GLhalfNV' || $base == 'GLhalfARB') {
+        return .ok('uint16');
+    }
+
+    if ($base == 'GLfloat' || $base == 'GLclampf') {
+        return .ok('float32');
+    }
+
+    if ($base == 'GLdouble' || $base == 'GLclampd') {
+        return .ok('float64');
+    }
+
+    if ($base == 'GLintptr' || $base == 'GLintptrARB' || $base == 'GLsizeiptr' || $base == 'GLsizeiptrARB') {
+        return .ok('isize');
+    }
+
+    if ($base == 'GLint64' || $base == 'GLint64EXT') {
+        return .ok('int64');
+    }
+
+    if ($base == 'GLuint64' || $base == 'GLuint64EXT') {
+        return .ok('uint64');
+    }
+
+    if ($base == 'GLsync' || $base->starts('GLeglImage') || $base == 'GLeglClientBufferEXT') {
+        return .ok('ptr<uint8>');
+    }
+
+    if ($base == 'GLDEBUGPROC' || $base == 'GLDEBUGPROCKHR' || $base == 'GLDEBUGPROCARB') {
+        return .ok('extern function<void(uint32, uint32, uint32, uint32, int32, ptr<const uint8>, ptr<const uint8>)>');
+    }
+
+    if ($base == 'GLDEBUGPROCAMD' || $base == 'GLVULKANPROCNV') {
+        return .ok('ptr<uint8>');
+    }
+
+    if ($base == 'GLhandleARB' || $base == 'GLvdpauSurfaceNV' || $base->starts('struct ')) {
+        return .error(.refuseSize($where, $base));
+    }
+
+    return .error(.unknownType($where, $base));
+}
+
+private function skipSpaces(const string& $s, usize& $i) : void
+{
+    while ($i < $s->size()) {
+        uint8 $b = $s->byte($i);
+
+        if ($b == 32 || $b == 9 || $b == 10 || $b == 13) {
+            $i = $i + 1;
+        } else {
+            break;
+        }
+    }
+}
+
+private function atKeyword(const string& $s, usize $i, const string& $word) : bool
+{
+    usize $n = $word->size();
+
+    if ($i >= $s->size()) {
+        return false;
+    }
+
+    if ($n > $s->size() - $i) {
+        return false;
+    }
+
+    if ($s->sub($i, $n) != $word) {
+        return false;
+    }
+
+    if ($i + $n < $s->size()) {
+        if (isIdentChar($s->byte($i + $n))) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+private function takeIdent(const string& $s, usize& $i) : string
+{
+    usize $start = $i;
+
+    if ($i < $s->size() && isIdentStart($s->byte($i))) {
+        $i = $i + 1;
+
+        while ($i < $s->size() && isIdentChar($s->byte($i))) {
+            $i = $i + 1;
+        }
+    }
+
+    if ($i == $start) {
+        return '';
+    }
+
+    return $s->sub($start, $i - $start);
+}
+
+private function isIdentStart(uint8 $b) : bool
+{
+    if ($b >= 65 && $b <= 90) {
+        return true;
+    }
+
+    if ($b >= 97 && $b <= 122) {
+        return true;
+    }
+
+    if ($b == 95) {
+        return true;
+    }
+
+    return false;
+}
+
+private function isIdentChar(uint8 $b) : bool
+{
+    if (isIdentStart($b)) {
+        return true;
+    }
+
+    if ($b >= 48 && $b <= 57) {
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * Hex / decimal enum value, with the rare negative folded to 32-bit two's complement.
+ */
+public function parseEnum(const string& $text) : result<uint64, Error>
+{
+    $s = str::trim($text);
+
+    if ($s->empty()) {
+        return .error(.emptyEnumValue);
+    }
+
+    if ($s->byte(0) == 45) {
+        int64 $n = guard str::int($s) else {
+            return .error(.notInteger($s));
+        }
+
+        if ($n >= 0) {
+            return .ok($n as uint64);
+        }
+
+        if ($n < -2147483648) {
+            return .error(.enumDoesNotFit($s));
+        }
+
+        uint64 $mag = (0 - $n) as uint64;
+        uint64 $two32 = 0x100000000;
+
+        return .ok($two32 - $mag);
+    }
+
+    $body = stripIntSuffix($s);
+    uint64 $v = guard str::uint($body) else {
+        return .error(.notUnsigned($s));
+    }
+
+    return .ok($v);
+}
+
+private function stripIntSuffix(const string& $s) : string
+{
+    usize $n = $s->size();
+
+    while ($n > 0) {
+        uint8 $b = $s->byte($n - 1);
+
+        if ($b == 117 || $b == 85 || $b == 108 || $b == 76) {
+            $n = $n - 1;
+        } else {
+            break;
+        }
+    }
+
+    return $s->sub(0, $n);
+}

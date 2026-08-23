@@ -1,0 +1,13 @@
+/**
+ * `str::from` for generate's error type, so `"{$e}"` works.
+ *
+ * A file of its own because a namespace is a property of the file: `error.eco`
+ * is `namespace glgen;` and cannot also be `namespace str;`.
+ */
+
+namespace str;
+
+public function from(const glgen::Error& $e) : string
+{
+    return $e->message();
+}

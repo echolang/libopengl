@@ -1,0 +1,412 @@
+/**
+ * A pull cursor over the Khronos registry XML.
+ *
+ * Skips `<?...?>` and `<!-- -->`. Text and attribute values decode exactly the
+ * five XML entities. The `<types>` / `<comment>` / `<kinds>` bodies are raw C
+ * (or prose) and are never parsed: `skipPastClose` searches for the literal
+ * close tag.
+ */
+
+namespace glgen::xml;
+
+public struct Tag
+{
+    public string $name;
+    public ordered_map<string, string> $attrs;
+    public bool $selfClosing;
+    public bool $closing;
+
+    public constructor()
+    {
+        $this->name = '';
+        $this->attrs = ordered_map<string, string>();
+        $this->selfClosing = false;
+        $this->closing = false;
+    }
+
+    public const function attr(const string& $name) : string
+    {
+        if (!$this->attrs->has($name)) {
+            return '';
+        }
+
+        return $this->attrs->get($name);
+    }
+}
+
+public struct Cursor
+{
+    public string $xml;
+    public usize $pos;
+
+    public constructor(string $xml)
+    {
+        $this->xml = $xml;
+        $this->pos = 0;
+    }
+
+    public const function eof() : bool
+    {
+        return $this->pos >= $this->xml->size();
+    }
+
+    public const function peek() : uint8
+    {
+        if ($this->eof()) {
+            return 0;
+        }
+
+        return $this->xml->byte($this->pos);
+    }
+
+    public function bump() : void
+    {
+        if (!$this->eof()) {
+            $this->pos = $this->pos + 1;
+        }
+    }
+
+    public const function starts(const string& $s) : bool
+    {
+        if ($this->eof()) {
+            return false;
+        }
+
+        if ($s->size() > $this->xml->size() - $this->pos) {
+            return false;
+        }
+
+        return $this->xml->sub($this->pos, $s->size()) == $s;
+    }
+
+    public function skipWs() : void
+    {
+        while (!$this->eof()) {
+            uint8 $b = $this->peek();
+
+            if ($b == 32 || $b == 9 || $b == 10 || $b == 13) {
+                $this->bump();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /**
+     * Advance to the next `<`. Whitespace and ordinary text in between are dropped.
+     */
+    public function skipToTag() : void
+    {
+        while (!$this->eof()) {
+            if ($this->peek() == 60) {
+                return;
+            }
+
+            $this->bump();
+        }
+    }
+
+    /**
+     * Text up to the next `<`, with entities decoded. Empty when already at a tag or EOF.
+     */
+    public function takeText() : string
+    {
+        usize $start = $this->pos;
+
+        while (!$this->eof()) {
+            if ($this->peek() == 60) {
+                break;
+            }
+
+            $this->bump();
+        }
+
+        if ($this->pos == $start) {
+            return '';
+        }
+
+        return decode($this->xml->sub($start, $this->pos - $start));
+    }
+
+    /**
+     * Literal `</name>` search from the current position. True when it was found
+     * and the cursor now sits past it.
+     */
+    public function skipPastClose(const string& $name) : bool
+    {
+        $needle = "</{$name}>";
+        usize $at = $this->xml->find($needle, $this->pos);
+
+        if ($at >= $this->xml->size()) {
+            return false;
+        }
+
+        $this->pos = $at + $needle->size();
+
+        return true;
+    }
+
+    /**
+     * The next element, processing instruction and comment skipped. `null` at EOF
+     * or when the remaining input is not a tag.
+     */
+    public function nextTag() : Tag?
+    {
+        while (true) {
+            $this->skipToTag();
+
+            if ($this->eof()) {
+                return null;
+            }
+
+            if ($this->starts('<?')) {
+                if (!$this->skipPi()) {
+                    return null;
+                }
+
+                continue;
+            }
+
+            if ($this->starts('<!--')) {
+                if (!$this->skipComment()) {
+                    return null;
+                }
+
+                continue;
+            }
+
+            return $this->parseTag();
+        }
+    }
+
+    private function skipPi() : bool
+    {
+        usize $at = $this->xml->find('?>', $this->pos);
+
+        if ($at >= $this->xml->size()) {
+            $this->pos = $this->xml->size();
+
+            return false;
+        }
+
+        $this->pos = $at + 2;
+
+        return true;
+    }
+
+    private function skipComment() : bool
+    {
+        usize $at = $this->xml->find('-->', $this->pos);
+
+        if ($at >= $this->xml->size()) {
+            $this->pos = $this->xml->size();
+
+            return false;
+        }
+
+        $this->pos = $at + 3;
+
+        return true;
+    }
+
+    private function parseTag() : Tag?
+    {
+        if ($this->peek() != 60) {
+            return null;
+        }
+
+        $this->bump();
+
+        $tag = Tag();
+
+        if ($this->peek() == 47) {
+            $tag->closing = true;
+            $this->bump();
+        }
+
+        $tag->name = $this->takeName();
+
+        if ($tag->name->empty()) {
+            return null;
+        }
+
+        while (true) {
+            $this->skipWs();
+
+            if ($this->eof()) {
+                return null;
+            }
+
+            uint8 $b = $this->peek();
+
+            if ($b == 62) {
+                $this->bump();
+                break;
+            }
+
+            if ($b == 47) {
+                $this->bump();
+                $this->skipWs();
+
+                if ($this->peek() != 62) {
+                    return null;
+                }
+
+                $this->bump();
+                $tag->selfClosing = true;
+                break;
+            }
+
+            $key = $this->takeName();
+
+            if ($key->empty()) {
+                return null;
+            }
+
+            $this->skipWs();
+
+            if ($this->peek() != 61) {
+                return null;
+            }
+
+            $this->bump();
+            $this->skipWs();
+
+            $value = guard $this->takeQuoted() else {
+                return null;
+            }
+
+            $tag->attrs[$key] = $value;
+        }
+
+        return $tag;
+    }
+
+    private function takeName() : string
+    {
+        usize $start = $this->pos;
+
+        while (!$this->eof()) {
+            uint8 $b = $this->peek();
+
+            if (isNameChar($b)) {
+                $this->bump();
+            } else {
+                break;
+            }
+        }
+
+        if ($this->pos == $start) {
+            return '';
+        }
+
+        return $this->xml->sub($start, $this->pos - $start);
+    }
+
+    private function takeQuoted() : string?
+    {
+        uint8 $q = $this->peek();
+
+        if ($q != 34 && $q != 39) {
+            return null;
+        }
+
+        $this->bump();
+        usize $start = $this->pos;
+
+        while (!$this->eof()) {
+            if ($this->peek() == $q) {
+                $raw = $this->xml->sub($start, $this->pos - $start);
+                $this->bump();
+
+                return decode($raw);
+            }
+
+            $this->bump();
+        }
+
+        return null;
+    }
+}
+
+private function isNameChar(uint8 $b) : bool
+{
+    if ($b >= 65 && $b <= 90) {
+        return true;
+    }
+
+    if ($b >= 97 && $b <= 122) {
+        return true;
+    }
+
+    if ($b >= 48 && $b <= 57) {
+        return true;
+    }
+
+    if ($b == 95 || $b == 45 || $b == 46 || $b == 58) {
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * Exactly `&amp; &lt; &gt; &quot; &apos;`. Unknown entities are left intact.
+ */
+public function decode(const string& $text) : string
+{
+    usize $amp = $text->find('&');
+
+    if ($amp >= $text->size()) {
+        return $text;
+    }
+
+    $out = '';
+    $out->reserve($text->size());
+    usize $i = 0;
+
+    while ($i < $text->size()) {
+        if ($text->byte($i) != 38) {
+            usize $run = $i;
+
+            while ($run < $text->size() && $text->byte($run) != 38) {
+                $run = $run + 1;
+            }
+
+            $out->append($text->sub($i, $run - $i));
+            $i = $run;
+            continue;
+        }
+
+        if (entityAt($text, $i, '&amp;')) {
+            $out->append('&');
+            $i = $i + 5;
+        } else if (entityAt($text, $i, '&lt;')) {
+            $out->append('<');
+            $i = $i + 4;
+        } else if (entityAt($text, $i, '&gt;')) {
+            $out->append('>');
+            $i = $i + 4;
+        } else if (entityAt($text, $i, '&quot;')) {
+            $out->append('"');
+            $i = $i + 6;
+        } else if (entityAt($text, $i, '&apos;')) {
+            $out->append("'");
+            $i = $i + 6;
+        } else {
+            $out->append('&');
+            $i = $i + 1;
+        }
+    }
+
+    return $out;
+}
+
+private function entityAt(const string& $text, usize $i, const string& $ent) : bool
+{
+    if ($ent->size() > $text->size() - $i) {
+        return false;
+    }
+
+    return $text->sub($i, $ent->size()) == $ent;
+}

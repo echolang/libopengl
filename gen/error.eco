@@ -1,0 +1,85 @@
+/**
+ * Why generate failed.
+ *
+ * An enum, so `guard` / `match` is the call site. The sentence comes from the
+ * case (`message()`, and `"{$e}"` via `str::from`), not from a string stored
+ * beside it.
+ */
+
+namespace glgen;
+
+public enum Error
+{
+    case flagNeedsValue(string $flag);
+    case unknownFlag(string $flag);
+    case badVersion(string $text);
+    case badNumber(string $text);
+
+    case emptyRegistry;
+    case expectedRegistry(string $got);
+    case unterminated(string $what);
+    case emptyCommand;
+    case missingProto;
+    case expectedClose(string $tag);
+
+    case missingStructName(string $text);
+    case missingTypeName(string $text);
+    case unterminatedArray(string $text);
+    case voidParam(string $where);
+    case refuseSize(string $where, string $base);
+    case unknownType(string $where, string $base);
+    case emptyEnumValue;
+    case notInteger(string $text);
+    case enumDoesNotFit(string $text);
+    case notUnsigned(string $text);
+
+    case unknownExtension(string $name);
+    case extensionApi(string $name, string $api, string $supported);
+    case missingEnum(string $name);
+    case missingCommand(string $name);
+
+    case emptyName(string $kind, string $gl);
+    case nonIdent(string $kind, string $gl, string $stripped);
+    case nameCollision(string $kind, string $echo, string $first, string $second);
+    case enumTooWide(string $name, uint64 $value);
+
+    case context(string $where, string $detail);
+
+    /**
+     * What went wrong, in words.
+     */
+    public const function message() : string
+    {
+        return match ($this) {
+            Error::flagNeedsValue($flag) => "{$flag} needs a value",
+            Error::unknownFlag($flag) => "unknown flag '{$flag}'",
+            Error::badVersion($text) => "version '{$text}' is not X.Y",
+            Error::badNumber($text) => "bad version number '{$text}'",
+            Error::emptyRegistry => 'registry XML is empty',
+            Error::expectedRegistry($got) => "expected <registry>, got <{$got}>",
+            Error::unterminated($what) => "unterminated {$what}",
+            Error::emptyCommand => 'empty <command>',
+            Error::missingProto => '<command> with no proto name',
+            Error::expectedClose($tag) => "expected </{$tag}>",
+            Error::missingStructName($text) => "missing struct name in '{$text}'",
+            Error::missingTypeName($text) => "missing type name in '{$text}'",
+            Error::unterminatedArray($text) => "unterminated array bound in '{$text}'",
+            Error::voidParam($where) => "{$where}: void parameter",
+            Error::refuseSize($where, $base) => "{$where}: refusing to size '{$base}'",
+            Error::unknownType($where, $base) => "{$where}: unknown type '{$base}'",
+            Error::emptyEnumValue => 'empty enum value',
+            Error::notInteger($text) => "not an integer: {$text}",
+            Error::enumDoesNotFit($text) => "enum value {$text} does not fit in 32-bit two's complement",
+            Error::notUnsigned($text) => "not an unsigned integer: {$text}",
+            Error::unknownExtension($name) => "unknown extension '{$name}'",
+            Error::extensionApi($name, $api, $supported) => "extension '{$name}' does not support api '{$api}' (supported={$supported})",
+            Error::missingEnum($name) => "required enum '{$name}' is not in the registry",
+            Error::missingCommand($name) => "required command '{$name}' is not in the registry",
+            Error::emptyName($kind, $gl) => "{$kind} '{$gl}' strips to an empty name",
+            Error::nonIdent($kind, $gl, $stripped) => "{$kind} '{$gl}' strips to non-identifier '{$stripped}'",
+            Error::nameCollision($kind, $echo, $first, $second) => "stripped {$kind} name '{$echo}' collides: {$first} and {$second}",
+            Error::enumTooWide($name, $value) => "enum {$name} value {$value} does not fit in uint32; mark it type=ull",
+            Error::context($where, $detail) => "{$where}: {$detail}",
+        };
+    }
+}

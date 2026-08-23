@@ -1,0 +1,46 @@
+/**
+ * Hand-written loader primitives. Names no generated symbol, so this file
+ * still compiles when `src/gl.eco` has been deleted for regeneration.
+ *
+ * The generated module calls these; they are not part of the public surface.
+ */
+
+namespace gl;
+
+internal const uint32 __NUM_EXTENSIONS = 0x821D;
+internal const uint32 __EXTENSIONS = 0x1F03;
+internal const uint32 __MAJOR_VERSION = 0x821B;
+internal const uint32 __MINOR_VERSION = 0x821C;
+
+internal function __getInt(extern function<void(uint32, ptr<int32>)> $get, uint32 $pname) : int32
+{
+    int32 $v = 0;
+    $get($pname, &$v);
+
+    return $v;
+}
+
+internal function __extSupported(
+    extern function<ptr<const uint8>(uint32, uint32)> $getStringi,
+    int32 $count,
+    const string& $wanted
+) : bool
+{
+    int32 $i = 0;
+
+    while ($i < $count) {
+        ptr<const uint8> $p = $getStringi(__EXTENSIONS, $i as uint32);
+
+        if ($p:$ != null) {
+            $name = str::from($p:$);
+
+            if ($name == $wanted) {
+                return true;
+            }
+        }
+
+        $i = $i + 1;
+    }
+
+    return false;
+}

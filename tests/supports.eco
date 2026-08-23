@@ -1,0 +1,39 @@
+/**
+ * `__extSupported` over a fake GetStringi. Static strings keep the cstr
+ * pointers alive for the whole process.
+ */
+
+private struct ExtFix
+{
+    internal static string $debug = 'GL_KHR_debug';
+    internal static string $arb = 'GL_ARB_direct_state_access';
+}
+
+private function fakeStringi(uint32 $pname, uint32 $index) : ptr<const uint8>
+{
+    if ($index == 0) {
+        return ExtFix::$debug->cstr();
+    }
+
+    if ($index == 1) {
+        return ExtFix::$arb->cstr();
+    }
+
+    return null;
+}
+
+test ext_supported_finds_a_name
+{
+    assert(gl::__extSupported(&fakeStringi, 2, 'GL_KHR_debug'));
+    assert(gl::__extSupported(&fakeStringi, 2, 'GL_ARB_direct_state_access'));
+}
+
+test ext_supported_rejects_a_missing_name
+{
+    assert(!gl::__extSupported(&fakeStringi, 2, 'GL_KHR_texture_compression_astc_hdr'));
+}
+
+test ext_supported_empty_list_is_false
+{
+    assert(!gl::__extSupported(&fakeStringi, 0, 'GL_KHR_debug'));
+}

@@ -1,0 +1,198 @@
+/*
+ * libopengl generate
+ *
+ * Parse argv, run the pipeline, write src/gl.eco (or --check it). Every stage
+ * is a result; a failure is a line on stderr and exit 1.
+ */
+
+use glgen::reg;
+use glgen::feat;
+use glgen::emit;
+use glgen::Error;
+
+internal const string REGISTRY_SHA = '0eab18f308d29bb54aa4667013ae505d73a72194';
+
+private struct Args
+{
+    public string $xml;
+    public string $out;
+    public string $api;
+    public string $version;
+    public string $profile;
+    public array<string> $exts;
+    public bool $check;
+    public bool $help;
+
+    public constructor()
+    {
+        $this->xml = 'gl.xml';
+        $this->out = 'src/gl.eco';
+        $this->api = 'gl';
+        $this->version = '4.6';
+        $this->profile = 'core';
+        $this->exts = array<string>();
+        $this->check = false;
+        $this->help = false;
+    }
+}
+
+private function usage() : string
+{
+    return 'libopengl generate
+  --xml PATH        Khronos registry (default gl.xml)
+  --out PATH        generated module (default src/gl.eco)
+  --api NAME        api to fold (default gl)
+  --version X.Y     maximum version (default 4.6)
+  --profile NAME    profile (default core)
+  --ext NAME        extension to include, repeatable
+  --check           regenerate in memory, compare, write nothing
+';
+}
+
+private function parseArgs(const array<string>& $argv) : result<Args, Error>
+{
+    $args = Args();
+    usize $i = 1;
+
+    while ($i < $argv->count()) {
+        $a = $argv[$i];
+
+        if ($a == '--help' || $a == '-h') {
+            $args->help = true;
+            return .ok($args);
+        }
+
+        if ($a == '--check') {
+            $args->check = true;
+            $i = $i + 1;
+            continue;
+        }
+
+        if ($a == '--xml' || $a == '--out' || $a == '--api' || $a == '--version' || $a == '--profile' || $a == '--ext') {
+            if ($i + 1 >= $argv->count()) {
+                return .error(.flagNeedsValue($a));
+            }
+
+            $v = $argv[$i + 1];
+
+            if ($a == '--xml') {
+                $args->xml = $v;
+            } else if ($a == '--out') {
+                $args->out = $v;
+            } else if ($a == '--api') {
+                $args->api = $v;
+            } else if ($a == '--version') {
+                $args->version = $v;
+            } else if ($a == '--profile') {
+                $args->profile = $v;
+            } else {
+                $args->exts[] = $v;
+            }
+
+            $i = $i + 2;
+            continue;
+        }
+
+        return .error(.unknownFlag($a));
+    }
+
+    return .ok($args);
+}
+
+private function parseVersion(const string& $text, int32& $major, int32& $minor) : result<bool, Error>
+{
+    $bits = str::split($text, '.');
+
+    if ($bits->count() != 2) {
+        return .error(.badVersion($text));
+    }
+
+    int64 $maj = guard str::int(string::from($bits->at(0))) else {
+        return .error(.badVersion($text));
+    }
+
+    int64 $min = guard str::int(string::from($bits->at(1))) else {
+        return .error(.badVersion($text));
+    }
+
+    $major = $maj as int32;
+    $minor = $min as int32;
+
+    return .ok(true);
+}
+
+private function invocation(const Args& $args) : string
+{
+    $s = "generate --api {$args->api} --version {$args->version} --profile {$args->profile}";
+    usize $i = 0;
+
+    while ($i < $args->exts->count()) {
+        $s->append(" --ext {$args->exts[$i]}");
+        $i = $i + 1;
+    }
+
+    return $s;
+}
+
+$argv = std::env::argv();
+$args = guard parseArgs($argv) else ($e) {
+    die($e->message());
+}
+
+if ($args->help) {
+    std::io::print(usage());
+    std::env::exit(0);
+}
+
+int32 $major = 0;
+int32 $minor = 0;
+$ver = parseVersion($args->version, $major, $minor);
+
+if ($ver->failed()) {
+    die($ver->failure()->message());
+}
+
+$xml = guard std::io::readfile($args->xml) else ($e) {
+    die($e->message());
+}
+
+$reg = guard reg::parse($xml) else ($e) {
+    die($e->message());
+}
+
+$folded = guard feat::fold($reg, $args->api, $major, $minor, $args->profile, $args->exts) else ($e) {
+    die($e->message());
+}
+
+$banner = emit::Banner();
+$banner->invocation = invocation($args);
+$banner->api = $args->api;
+$banner->version = $args->version;
+$banner->profile = $args->profile;
+$banner->extensions = $args->exts;
+$banner->registrySha = REGISTRY_SHA;
+
+$em = guard emit::emitModule($folded, $banner) else ($e) {
+    die($e->message());
+}
+
+if ($args->check) {
+    $have = guard std::io::readfile($args->out) else ($e) {
+        die("{$args->out} is missing or unreadable ({$e->message()}); rerun generate");
+    }
+
+    if ($have != $em->source) {
+        die("{$args->out} is out of date; rerun generate");
+    }
+
+    std::io::println("{$args->out} is up to date");
+    std::env::exit(0);
+}
+
+$wrote = std::io::writefile($args->out, $em->source);
+
+if ($wrote->failed()) {
+    die($wrote->failure()->message());
+}
+
+std::io::println("wrote {$args->out}: {$em->nEnums} constants, {$em->nCommands} commands, {$em->nStubs} stubs");

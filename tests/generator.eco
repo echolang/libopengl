@@ -1,0 +1,276 @@
+/**
+ * Generator internals: scanner, declarators, the negative-value fold, a
+ * toy feature fold, and emit determinism. No GPU, no committed gl.eco.
+ */
+
+test scanner_reads_attrs_and_self_closing
+{
+    $c = glgen::xml::Cursor('<enum value="0x0B71" name="GL_DEPTH_TEST"/>');
+    $t = guard $c->nextTag() else {
+        die('expected a tag');
+    }
+
+    assert($t->name == 'enum');
+    assert($t->selfClosing);
+    assert(!$t->closing);
+    assert($t->attr('value') == '0x0B71');
+    assert($t->attr('name') == 'GL_DEPTH_TEST');
+}
+
+test scanner_skips_comments_and_pi
+{
+    $xml = '<?xml version="1.0"?><!-- hidden --><a/><!-- still --><b></b>';
+    $c = glgen::xml::Cursor($xml);
+    $a = guard $c->nextTag() else {
+        die('expected <a/>');
+    }
+    $b = guard $c->nextTag() else {
+        die('expected <b>');
+    }
+    $end = guard $c->nextTag() else {
+        die('expected </b>');
+    }
+
+    assert($a->name == 'a' && $a->selfClosing);
+    assert($b->name == 'b' && !$b->closing && !$b->selfClosing);
+    assert($end->name == 'b' && $end->closing);
+}
+
+test scanner_decodes_entities
+{
+    assert(glgen::xml::decode('a&amp;b') == 'a&b');
+    assert(glgen::xml::decode('&lt;x&gt;') == '<x>');
+    assert(glgen::xml::decode('&quot;q&apos;') == '"q\'');
+    assert(glgen::xml::decode('plain') == 'plain');
+}
+
+test scanner_take_text_and_skip_past_close
+{
+    $c = glgen::xml::Cursor('<types>typedef int X;</types><ok/>');
+    $types = guard $c->nextTag() else {
+        die('types');
+    }
+
+    assert($types->name == 'types');
+    assert($c->skipPastClose('types'));
+
+    $ok = guard $c->nextTag() else {
+        die('ok');
+    }
+
+    assert($ok->name == 'ok');
+}
+
+test declarator_const_char_star_const_star
+{
+    $p = glgen::types::Pieces();
+    $p->prefix = 'const ';
+    $p->ptype = 'GLchar';
+    $p->mid = ' *const*';
+    $p->name = 'string';
+
+    $d = guard glgen::types::fromPieces($p) else ($e) {
+        die($e->message());
+    }
+
+    assert($d->base == 'GLchar');
+    assert($d->baseConst);
+    assert($d->stars == 2);
+    assert($d->name == 'string');
+
+    $ty = guard glgen::types::echoType($d, false, 'glShaderSource') else ($e) {
+        die($e->message());
+    }
+
+    assert($ty == 'ptr<ptr<const uint8>>');
+}
+
+test declarator_void_star_return
+{
+    $d = guard glgen::types::parse('void *') else ($e) {
+        die($e->message());
+    }
+
+    $ty = guard glgen::types::echoType($d, true, 'glMapBuffer') else ($e) {
+        die($e->message());
+    }
+
+    assert($ty == 'ptr<uint8>');
+}
+
+test negative_enum_is_twos_complement
+{
+    uint64 $v = guard glgen::types::parseEnum('-2') else ($e) {
+        die($e->message());
+    }
+
+    assert($v == 0xFFFFFFFE);
+
+    uint64 $hex = guard glgen::types::parseEnum('0x0B71') else ($e) {
+        die($e->message());
+    }
+
+    assert($hex == 0x0B71);
+
+    uint64 $ull = guard glgen::types::parseEnum('0xFFFFFFFFFFFFFFFF') else ($e) {
+        die($e->message());
+    }
+
+    assert($ull == 0xFFFFFFFFFFFFFFFF);
+}
+
+test naming_strips_prefixes
+{
+    $c = guard glgen::emit::constName('GL_DEPTH_TEST') else ($e) {
+        die($e->message());
+    }
+    $f = guard glgen::emit::fnName('glDrawArrays') else ($e) {
+        die($e->message());
+    }
+
+    assert($c == 'DEPTH_TEST');
+    assert($f == 'DrawArrays');
+    assert(glgen::emit::paramName('string', 0) == 'string');
+    assert(glgen::emit::paramName('this', 3) == 'p3');
+}
+
+test fold_core_remove_and_extension
+{
+    $reg = glgen::reg::Registry();
+
+    $keep = glgen::reg::EnumDef();
+    $keep->name = 'GL_KEEP';
+    $keep->value = 1;
+    $reg->enums['GL_KEEP'] = $keep;
+
+    $gone = glgen::reg::EnumDef();
+    $gone->name = 'GL_GONE';
+    $gone->value = 2;
+    $reg->enums['GL_GONE'] = $gone;
+
+    $extE = glgen::reg::EnumDef();
+    $extE->name = 'GL_EXT_E';
+    $extE->value = 3;
+    $reg->enums['GL_EXT_E'] = $extE;
+
+    $draw = glgen::reg::Command();
+    $draw->name = 'glKeep';
+    $draw->retEcho = 'void';
+    $reg->commands['glKeep'] = $draw;
+
+    $old = glgen::reg::Command();
+    $old->name = 'glBegin';
+    $old->retEcho = 'void';
+    $reg->commands['glBegin'] = $old;
+
+    $extC = glgen::reg::Command();
+    $extC->name = 'glExt';
+    $extC->retEcho = 'void';
+    $reg->commands['glExt'] = $extC;
+
+    $v10 = glgen::reg::Feature();
+    $v10->api = 'gl';
+    $v10->name = 'GL_VERSION_1_0';
+    $v10->major = 1;
+    $v10->minor = 0;
+
+    $r10 = glgen::reg::RequireSet();
+    $r10->enums[] = 'GL_KEEP';
+    $r10->enums[] = 'GL_GONE';
+    $r10->commands[] = 'glKeep';
+    $r10->commands[] = 'glBegin';
+    $v10->requires[] = $r10;
+    $reg->features[] = $v10;
+
+    $v32 = glgen::reg::Feature();
+    $v32->api = 'gl';
+    $v32->name = 'GL_VERSION_3_2';
+    $v32->major = 3;
+    $v32->minor = 2;
+
+    $rm = glgen::reg::RequireSet();
+    $rm->profile = 'core';
+    $rm->enums[] = 'GL_GONE';
+    $rm->commands[] = 'glBegin';
+    $v32->removes[] = $rm;
+    $reg->features[] = $v32;
+
+    $gles = glgen::reg::Feature();
+    $gles->api = 'gles2';
+    $gles->name = 'GL_ES_VERSION_2_0';
+    $gles->major = 2;
+    $gles->minor = 0;
+    $reg->features[] = $gles;
+
+    $ext = glgen::reg::Extension();
+    $ext->name = 'GL_KHR_debug';
+    $ext->supported = 'gl|glcore';
+    $er = glgen::reg::RequireSet();
+    $er->api = 'gl';
+    $er->enums[] = 'GL_EXT_E';
+    $er->commands[] = 'glExt';
+    $ext->requires[] = $er;
+    $es = glgen::reg::RequireSet();
+    $es->api = 'gles2';
+    $es->enums[] = 'GL_GONE';
+    $ext->requires[] = $es;
+    $reg->extensions['GL_KHR_debug'] = $ext;
+
+    $exts = array<string>();
+    $exts[] = 'GL_KHR_debug';
+
+    $f = guard glgen::feat::fold($reg, 'gl', 4, 6, 'core', $exts) else ($e) {
+        die($e->message());
+    }
+
+    assert($f->enums->count() == 2);
+    assert($f->enums[0]->name == 'GL_EXT_E');
+    assert($f->enums[1]->name == 'GL_KEEP');
+    assert($f->commands->count() == 2);
+    assert($f->commands[0]->name == 'glExt');
+    assert($f->commands[1]->name == 'glKeep');
+}
+
+test emit_is_deterministic
+{
+    $f = glgen::feat::Folded();
+
+    $e = glgen::reg::EnumDef();
+    $e->name = 'GL_DEPTH_TEST';
+    $e->value = 0x0B71;
+    $f->enums[] = $e;
+
+    $c = glgen::reg::Command();
+    $c->name = 'glGetError';
+    $c->retEcho = 'uint32';
+    $f->commands[] = $c;
+
+    $d = glgen::reg::Command();
+    $d->name = 'glDrawArrays';
+    $d->retEcho = 'void';
+    $d->params[] = glgen::reg::Param('mode', 'uint32');
+    $d->params[] = glgen::reg::Param('first', 'int32');
+    $d->params[] = glgen::reg::Param('count', 'int32');
+    $f->commands[] = $d;
+
+    $b = glgen::emit::Banner();
+    $b->invocation = 'generate --api gl --version 4.6 --profile core';
+    $b->api = 'gl';
+    $b->version = '4.6';
+    $b->profile = 'core';
+    $b->registrySha = 'deadbeef';
+
+    $a = guard glgen::emit::emitModule($f, $b) else ($err) {
+        die($err->message());
+    }
+    $again = guard glgen::emit::emitModule($f, $b) else ($err) {
+        die($err->message());
+    }
+
+    assert($a->source == $again->source);
+    assert($a->nEnums == 1);
+    assert($a->nCommands == 2);
+    assert($a->source->contains('DEPTH_TEST'));
+    assert($a->source->contains('function DrawArrays('));
+    assert($a->source->contains("$nm = 'glGetError';"));
+}

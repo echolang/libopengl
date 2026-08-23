@@ -1,0 +1,272 @@
+/**
+ * Feature / profile / extension fold.
+ *
+ * Walks features in document order, keeps `api == $api` whose version is at
+ * most the requested one, then each `--ext`. A RequireSet applies when its
+ * `api` and `profile` are empty or match. Requires set the name true, removes
+ * set it false. Sorted order is the one canonical order for everything emit
+ * writes.
+ */
+
+namespace glgen::feat;
+
+use glgen::reg;
+use glgen::Error;
+
+public struct Folded
+{
+    public array<reg::EnumDef> $enums;
+    public array<reg::Command> $commands;
+
+    public constructor()
+    {
+        $this->enums = array<reg::EnumDef>();
+        $this->commands = array<reg::Command>();
+    }
+}
+
+public function fold(
+    const reg::Registry& $reg,
+    const string& $api,
+    int32 $major,
+    int32 $minor,
+    const string& $profile,
+    const array<string>& $exts
+) : result<Folded, Error>
+{
+    $enumSet = map<string, bool>();
+    $cmdSet = map<string, bool>();
+
+    usize $i = 0;
+
+    while ($i < $reg->features->count()) {
+        $f = $reg->features[$i];
+
+        if ($f->api == $api && versionLe($f->major, $f->minor, $major, $minor)) {
+            applySets($f->requires, true, $api, $profile, $enumSet, $cmdSet);
+            applySets($f->removes, false, $api, $profile, $enumSet, $cmdSet);
+        }
+
+        $i = $i + 1;
+    }
+
+    usize $e = 0;
+
+    while ($e < $exts->count()) {
+        $name = $exts[$e];
+
+        if (!$reg->extensions->has($name)) {
+            return .error(.unknownExtension($name));
+        }
+
+        $ext = $reg->extensions->get($name);
+
+        if (!supportedFor($ext->supported, $api)) {
+            return .error(.extensionApi($name, $api, $ext->supported));
+        }
+
+        applySets($ext->requires, true, $api, $profile, $enumSet, $cmdSet);
+        $e = $e + 1;
+    }
+
+    $out = Folded();
+
+    foreach ($enumSet as $name => $keep) {
+        if (!$keep) {
+            continue;
+        }
+
+        if (!$reg->enums->has($name)) {
+            return .error(.missingEnum($name));
+        }
+
+        $out->enums[] = $reg->enums->get($name);
+    }
+
+    foreach ($cmdSet as $name => $keep) {
+        if (!$keep) {
+            continue;
+        }
+
+        if (!$reg->commands->has($name)) {
+            return .error(.missingCommand($name));
+        }
+
+        reg::Command $cmd = $reg->commands->get($name);
+        $bound = reg::bindEchoTypes($cmd);
+
+        if ($bound->failed()) {
+            return .error($bound->failure());
+        }
+
+        $out->commands[] = $cmd;
+    }
+
+    sortEnums($out->enums);
+    sortCommands($out->commands);
+
+    return .ok($out);
+}
+
+private function applySets(
+    const array<reg::RequireSet>& $sets,
+    bool $keep,
+    const string& $api,
+    const string& $profile,
+    map<string, bool>& $enumSet,
+    map<string, bool>& $cmdSet
+) : void
+{
+    usize $i = 0;
+
+    while ($i < $sets->count()) {
+        $set = $sets[$i];
+
+        if (applies($set, $api, $profile)) {
+            usize $n = 0;
+
+            while ($n < $set->enums->count()) {
+                $enumSet[$set->enums[$n]] = $keep;
+                $n = $n + 1;
+            }
+
+            $n = 0;
+
+            while ($n < $set->commands->count()) {
+                $cmdSet[$set->commands[$n]] = $keep;
+                $n = $n + 1;
+            }
+        }
+
+        $i = $i + 1;
+    }
+}
+
+private function applies(const reg::RequireSet& $set, const string& $api, const string& $profile) : bool
+{
+    if ($set->api != '' && $set->api != $api) {
+        return false;
+    }
+
+    if ($set->profile != '' && $set->profile != $profile) {
+        return false;
+    }
+
+    return true;
+}
+
+private function supportedFor(const string& $supported, const string& $api) : bool
+{
+    $bits = str::split($supported, '|');
+    usize $i = 0;
+
+    while ($i < $bits->count()) {
+        $bit = string::from($bits->at($i));
+
+        if ($bit == $api || $bit == 'glcore') {
+            return true;
+        }
+
+        $i = $i + 1;
+    }
+
+    return false;
+}
+
+private function versionLe(int32 $aMaj, int32 $aMin, int32 $bMaj, int32 $bMin) : bool
+{
+    if ($aMaj < $bMaj) {
+        return true;
+    }
+
+    if ($aMaj > $bMaj) {
+        return false;
+    }
+
+    if ($aMin <= $bMin) {
+        return true;
+    }
+
+    return false;
+}
+
+public function lessBytes(const string& $a, const string& $b) : bool
+{
+    usize $n = $a->size();
+
+    if ($b->size() < $n) {
+        $n = $b->size();
+    }
+
+    usize $i = 0;
+
+    while ($i < $n) {
+        uint8 $ca = $a->byte($i);
+        uint8 $cb = $b->byte($i);
+
+        if ($ca != $cb) {
+            return $ca < $cb;
+        }
+
+        $i = $i + 1;
+    }
+
+    return $a->size() < $b->size();
+}
+
+private function sortEnums(array<reg::EnumDef>& $items) : void
+{
+    usize $n = $items->count();
+    usize $i = 1;
+
+    while ($i < $n) {
+        $key = $items[$i];
+        usize $j = $i;
+
+        while ($j > 0 && lessBytes($key->name, $items[$j - 1]->name)) {
+            $items[$j] = $items[$j - 1];
+            $j = $j - 1;
+        }
+
+        $items[$j] = $key;
+        $i = $i + 1;
+    }
+}
+
+private function sortCommands(array<reg::Command>& $items) : void
+{
+    usize $n = $items->count();
+    usize $i = 1;
+
+    while ($i < $n) {
+        $key = $items[$i];
+        usize $j = $i;
+
+        while ($j > 0 && lessBytes($key->name, $items[$j - 1]->name)) {
+            $items[$j] = $items[$j - 1];
+            $j = $j - 1;
+        }
+
+        $items[$j] = $key;
+        $i = $i + 1;
+    }
+}
+
+public function sortNames(array<string>& $items) : void
+{
+    usize $n = $items->count();
+    usize $i = 1;
+
+    while ($i < $n) {
+        $key = $items[$i];
+        usize $j = $i;
+
+        while ($j > 0 && lessBytes($key, $items[$j - 1])) {
+            $items[$j] = $items[$j - 1];
+            $j = $j - 1;
+        }
+
+        $items[$j] = $key;
+        $i = $i + 1;
+    }
+}

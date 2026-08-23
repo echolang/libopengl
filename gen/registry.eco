@@ -1,0 +1,675 @@
+/**
+ * The Khronos registry as data, plus the parse that fills one.
+ *
+ * Name keys are `ordered_map` so a walk is deterministic. Duplicate `<enum>`
+ * entries whose `api=` does not match the one already stored are skipped;
+ * `alias=` is ignored, because an aliased name has its own entry when a
+ * feature actually requires it.
+ */
+
+namespace glgen::reg;
+
+use glgen::xml;
+use glgen::types;
+use glgen::Error;
+
+public struct EnumDef
+{
+    public string $name;
+    public uint64 $value;
+    public string $kind;
+    public string $api;
+
+    public constructor()
+    {
+        $this->name = '';
+        $this->value = 0;
+        $this->kind = '';
+        $this->api = '';
+    }
+}
+
+public struct Param
+{
+    public string $cName;
+    public string $echoType;
+
+    public constructor()
+    {
+        $this->cName = '';
+        $this->echoType = '';
+    }
+
+    public constructor(string $cName, string $echoType)
+    {
+        $this->cName = $cName;
+        $this->echoType = $echoType;
+    }
+}
+
+public struct Command
+{
+    public string $name;
+    public string $retEcho;
+    public array<Param> $params;
+    public types::CDecl $retDecl;
+    public array<types::CDecl> $argDecls;
+
+    public constructor()
+    {
+        $this->name = '';
+        $this->retEcho = 'void';
+        $this->params = array<Param>();
+        $this->retDecl = types::CDecl();
+        $this->argDecls = array<types::CDecl>();
+    }
+}
+
+public function bindEchoTypes(Command& $cmd) : result<bool, Error>
+{
+    if ($cmd->retDecl->base->empty()) {
+        return .ok(true);
+    }
+
+    $ret = guard types::echoType($cmd->retDecl, true, $cmd->name) else ($e) {
+        return .error($e);
+    }
+
+    $cmd->retEcho = $ret;
+    $cmd->params = array<Param>();
+    usize $i = 0;
+
+    while ($i < $cmd->argDecls->count()) {
+        $d = $cmd->argDecls[$i];
+        $ty = guard types::echoType($d, false, $cmd->name) else ($e) {
+            return .error($e);
+        }
+
+        $cmd->params[] = Param($d->name, $ty);
+        $i = $i + 1;
+    }
+
+    return .ok(true);
+}
+
+public struct RequireSet
+{
+    public string $profile;
+    public string $api;
+    public array<string> $enums;
+    public array<string> $commands;
+
+    public constructor()
+    {
+        $this->profile = '';
+        $this->api = '';
+        $this->enums = array<string>();
+        $this->commands = array<string>();
+    }
+}
+
+public struct Feature
+{
+    public string $api;
+    public string $name;
+    public int32 $major;
+    public int32 $minor;
+    public array<RequireSet> $requires;
+    public array<RequireSet> $removes;
+
+    public constructor()
+    {
+        $this->api = '';
+        $this->name = '';
+        $this->major = 0;
+        $this->minor = 0;
+        $this->requires = array<RequireSet>();
+        $this->removes = array<RequireSet>();
+    }
+}
+
+public struct Extension
+{
+    public string $name;
+    public string $supported;
+    public array<RequireSet> $requires;
+
+    public constructor()
+    {
+        $this->name = '';
+        $this->supported = '';
+        $this->requires = array<RequireSet>();
+    }
+}
+
+public struct Registry
+{
+    public ordered_map<string, EnumDef> $enums;
+    public ordered_map<string, Command> $commands;
+    public array<Feature> $features;
+    public ordered_map<string, Extension> $extensions;
+
+    public constructor()
+    {
+        $this->enums = ordered_map<string, EnumDef>();
+        $this->commands = ordered_map<string, Command>();
+        $this->features = array<Feature>();
+        $this->extensions = ordered_map<string, Extension>();
+    }
+}
+
+public function parse(const string& $xml) : result<Registry, Error>
+{
+    $c = xml::Cursor($xml);
+    $reg = Registry();
+
+    $root = guard $c->nextTag() else {
+        return .error(.emptyRegistry);
+    }
+
+    if ($root->name != 'registry' || $root->closing) {
+        return .error(.expectedRegistry($root->name));
+    }
+
+    while (true) {
+        $t = guard $c->nextTag() else {
+            break;
+        }
+
+        if ($t->closing && $t->name == 'registry') {
+            break;
+        }
+
+        if ($t->closing) {
+            continue;
+        }
+
+        if ($t->name == 'comment' || $t->name == 'types' || $t->name == 'kinds') {
+            if (!$t->selfClosing) {
+                if (!$c->skipPastClose($t->name)) {
+                    return .error(.unterminated("<{$t->name}>"));
+                }
+            }
+
+            continue;
+        }
+
+        if ($t->name == 'enums') {
+            $ok = parseEnums($c, $t, $reg);
+
+            if ($ok->failed()) {
+                return .error($ok->failure());
+            }
+
+            continue;
+        }
+
+        if ($t->name == 'commands') {
+            $ok = parseCommands($c, $t, $reg);
+
+            if ($ok->failed()) {
+                return .error($ok->failure());
+            }
+
+            continue;
+        }
+
+        if ($t->name == 'feature') {
+            $f = guard parseFeature($c, $t) else ($e) {
+                return .error($e);
+            }
+
+            $reg->features[] = $f;
+            continue;
+        }
+
+        if ($t->name == 'extensions') {
+            $ok = parseExtensions($c, $t, $reg);
+
+            if ($ok->failed()) {
+                return .error($ok->failure());
+            }
+
+            continue;
+        }
+
+        if (!$t->selfClosing) {
+            if (!$c->skipPastClose($t->name)) {
+                return .error(.unterminated("<{$t->name}>"));
+            }
+        }
+    }
+
+    return .ok($reg);
+}
+
+private function parseEnums(xml::Cursor& $c, const xml::Tag& $open, Registry& $reg) : result<bool, Error>
+{
+    if ($open->selfClosing) {
+        return .ok(true);
+    }
+
+    while (true) {
+        $t = guard $c->nextTag() else {
+            return .error(.unterminated('<enums>'));
+        }
+
+        if ($t->closing && $t->name == 'enums') {
+            return .ok(true);
+        }
+
+        if ($t->name != 'enum' || $t->closing) {
+            if (!$t->selfClosing && !$t->closing) {
+                if (!$c->skipPastClose($t->name)) {
+                    return .error(.unterminated("<{$t->name}> in <enums>"));
+                }
+            }
+
+            continue;
+        }
+
+        $name = $t->attr('name');
+        $value = $t->attr('value');
+
+        if ($name->empty() || $value->empty()) {
+            continue;
+        }
+
+        if ($reg->enums->has($name)) {
+            $have = $reg->enums->get($name);
+            $api = $t->attr('api');
+
+            if ($api != '' && $api != $have->api) {
+                continue;
+            }
+
+            continue;
+        }
+
+        uint64 $n = guard types::parseEnum($value) else ($e) {
+            return .error(.context("enum {$name}", $e->message()));
+        }
+
+        $def = EnumDef();
+        $def->name = $name;
+        $def->value = $n;
+        $def->kind = $t->attr('type');
+        $def->api = $t->attr('api');
+        $reg->enums[$name] = $def;
+    }
+}
+
+private function parseCommands(xml::Cursor& $c, const xml::Tag& $open, Registry& $reg) : result<bool, Error>
+{
+    if ($open->selfClosing) {
+        return .ok(true);
+    }
+
+    while (true) {
+        $t = guard $c->nextTag() else {
+            return .error(.unterminated('<commands>'));
+        }
+
+        if ($t->closing && $t->name == 'commands') {
+            return .ok(true);
+        }
+
+        if ($t->name != 'command' || $t->closing) {
+            if (!$t->selfClosing && !$t->closing) {
+                if (!$c->skipPastClose($t->name)) {
+                    return .error(.unterminated("<{$t->name}> in <commands>"));
+                }
+            }
+
+            continue;
+        }
+
+        $cmd = guard parseCommand($c, $t) else ($e) {
+            return .error($e);
+        }
+
+        if (!$reg->commands->has($cmd->name)) {
+            $reg->commands[$cmd->name] = $cmd;
+        }
+    }
+}
+
+private function parseCommand(xml::Cursor& $c, const xml::Tag& $open) : result<Command, Error>
+{
+    $cmd = Command();
+
+    if ($open->selfClosing) {
+        return .error(.emptyCommand);
+    }
+
+    while (true) {
+        $t = guard $c->nextTag() else {
+            return .error(.unterminated('<command>'));
+        }
+
+        if ($t->closing && $t->name == 'command') {
+            break;
+        }
+
+        if ($t->closing) {
+            continue;
+        }
+
+        if ($t->name == 'proto') {
+            $p = guard collectMixed($c, $t, 'proto') else ($e) {
+                return .error($e);
+            }
+
+            $d = guard types::fromPieces($p) else ($e) {
+                return .error($e);
+            }
+
+            $cmd->name = $d->name;
+            $cmd->retDecl = $d;
+            continue;
+        }
+
+        if ($t->name == 'param') {
+            $p = guard collectMixed($c, $t, 'param') else ($e) {
+                return .error($e);
+            }
+
+            $d = guard types::fromPieces($p) else ($e) {
+                return .error(.context($cmd->name, $e->message()));
+            }
+
+            $cmd->argDecls[] = $d;
+            continue;
+        }
+
+        if (!$t->selfClosing) {
+            if (!$c->skipPastClose($t->name)) {
+                return .error(.unterminated("<{$t->name}> in command {$cmd->name}"));
+            }
+        }
+    }
+
+    if ($cmd->name->empty()) {
+        return .error(.missingProto);
+    }
+
+    return .ok($cmd);
+}
+
+private function collectMixed(xml::Cursor& $c, const xml::Tag& $open, const string& $close) : result<types::Pieces, Error>
+{
+    $p = types::Pieces();
+
+    if ($open->selfClosing) {
+        return .ok($p);
+    }
+
+    int32 $stage = 0;
+
+    while (true) {
+        if ($c->eof()) {
+            return .error(.unterminated("<{$close}>"));
+        }
+
+        if ($c->peek() == 60) {
+            $t = guard $c->nextTag() else {
+                return .error(.unterminated("<{$close}>"));
+            }
+
+            if ($t->closing && $t->name == $close) {
+                break;
+            }
+
+            if ($t->name == 'ptype' && !$t->closing) {
+                $p->ptype = str::trim($c->takeText());
+                $end = guard $c->nextTag() else {
+                    return .error(.unterminated('<ptype>'));
+                }
+
+                if (!$end->closing || $end->name != 'ptype') {
+                    return .error(.expectedClose('ptype'));
+                }
+
+                $stage = 1;
+                continue;
+            }
+
+            if ($t->name == 'name' && !$t->closing) {
+                $p->name = str::trim($c->takeText());
+                $end = guard $c->nextTag() else {
+                    return .error(.unterminated('<name>'));
+                }
+
+                if (!$end->closing || $end->name != 'name') {
+                    return .error(.expectedClose('name'));
+                }
+
+                $stage = 2;
+                continue;
+            }
+
+            if (!$t->selfClosing && !$t->closing) {
+                if (!$c->skipPastClose($t->name)) {
+                    return .error(.unterminated("<{$t->name}> in <{$close}>"));
+                }
+            }
+
+            continue;
+        }
+
+        $text = $c->takeText();
+
+        if ($stage == 0) {
+            $p->prefix->append($text);
+        } else if ($stage == 1) {
+            $p->mid->append($text);
+        } else {
+            $p->suffix->append($text);
+        }
+    }
+
+    return .ok($p);
+}
+
+private function parseFeature(xml::Cursor& $c, const xml::Tag& $open) : result<Feature, Error>
+{
+    $f = Feature();
+    $f->api = $open->attr('api');
+    $f->name = $open->attr('name');
+
+    $ver = parseNumber($open->attr('number'), $f);
+
+    if ($ver->failed()) {
+        return .error(.context("feature {$f->name}", $ver->failure()->message()));
+    }
+
+    if ($open->selfClosing) {
+        return .ok($f);
+    }
+
+    while (true) {
+        $t = guard $c->nextTag() else {
+            return .error(.unterminated("<feature> {$f->name}"));
+        }
+
+        if ($t->closing && $t->name == 'feature') {
+            break;
+        }
+
+        if ($t->closing) {
+            continue;
+        }
+
+        if ($t->name == 'require') {
+            $set = guard parseRequireSet($c, $t, 'require') else ($e) {
+                return .error($e);
+            }
+
+            $f->requires[] = $set;
+            continue;
+        }
+
+        if ($t->name == 'remove') {
+            $set = guard parseRequireSet($c, $t, 'remove') else ($e) {
+                return .error($e);
+            }
+
+            $f->removes[] = $set;
+            continue;
+        }
+
+        if (!$t->selfClosing) {
+            if (!$c->skipPastClose($t->name)) {
+                return .error(.unterminated("<{$t->name}> in feature {$f->name}"));
+            }
+        }
+    }
+
+    return .ok($f);
+}
+
+private function parseExtensions(xml::Cursor& $c, const xml::Tag& $open, Registry& $reg) : result<bool, Error>
+{
+    if ($open->selfClosing) {
+        return .ok(true);
+    }
+
+    while (true) {
+        $t = guard $c->nextTag() else {
+            return .error(.unterminated('<extensions>'));
+        }
+
+        if ($t->closing && $t->name == 'extensions') {
+            return .ok(true);
+        }
+
+        if ($t->name != 'extension' || $t->closing) {
+            if (!$t->selfClosing && !$t->closing) {
+                if (!$c->skipPastClose($t->name)) {
+                    return .error(.unterminated("<{$t->name}> in <extensions>"));
+                }
+            }
+
+            continue;
+        }
+
+        $ext = guard parseExtension($c, $t) else ($e) {
+            return .error($e);
+        }
+
+        if (!$reg->extensions->has($ext->name)) {
+            $reg->extensions[$ext->name] = $ext;
+        }
+    }
+}
+
+private function parseExtension(xml::Cursor& $c, const xml::Tag& $open) : result<Extension, Error>
+{
+    $ext = Extension();
+    $ext->name = $open->attr('name');
+    $ext->supported = $open->attr('supported');
+
+    if ($open->selfClosing) {
+        return .ok($ext);
+    }
+
+    while (true) {
+        $t = guard $c->nextTag() else {
+            return .error(.unterminated("<extension> {$ext->name}"));
+        }
+
+        if ($t->closing && $t->name == 'extension') {
+            break;
+        }
+
+        if ($t->closing) {
+            continue;
+        }
+
+        if ($t->name == 'require') {
+            $set = guard parseRequireSet($c, $t, 'require') else ($e) {
+                return .error($e);
+            }
+
+            $ext->requires[] = $set;
+            continue;
+        }
+
+        if (!$t->selfClosing) {
+            if (!$c->skipPastClose($t->name)) {
+                return .error(.unterminated("<{$t->name}> in extension {$ext->name}"));
+            }
+        }
+    }
+
+    return .ok($ext);
+}
+
+private function parseRequireSet(xml::Cursor& $c, const xml::Tag& $open, const string& $close) : result<RequireSet, Error>
+{
+    $set = RequireSet();
+    $set->profile = $open->attr('profile');
+    $set->api = $open->attr('api');
+
+    if ($open->selfClosing) {
+        return .ok($set);
+    }
+
+    while (true) {
+        $t = guard $c->nextTag() else {
+            return .error(.unterminated("<{$close}>"));
+        }
+
+        if ($t->closing && $t->name == $close) {
+            break;
+        }
+
+        if ($t->closing) {
+            continue;
+        }
+
+        if ($t->name == 'enum') {
+            $name = $t->attr('name');
+
+            if (!$name->empty()) {
+                $set->enums[] = $name;
+            }
+        } else if ($t->name == 'command') {
+            $name = $t->attr('name');
+
+            if (!$name->empty()) {
+                $set->commands[] = $name;
+            }
+        }
+
+        if (!$t->selfClosing) {
+            if (!$c->skipPastClose($t->name)) {
+                return .error(.unterminated("<{$t->name}> in <{$close}>"));
+            }
+        }
+    }
+
+    return .ok($set);
+}
+
+private function parseNumber(const string& $text, Feature& $f) : result<bool, Error>
+{
+    $bits = str::split($text, '.');
+
+    if ($bits->count() != 2) {
+        return .error(.badNumber($text));
+    }
+
+    int64 $maj = guard str::int(string::from($bits->at(0))) else {
+        return .error(.badNumber($text));
+    }
+
+    int64 $min = guard str::int(string::from($bits->at(1))) else {
+        return .error(.badNumber($text));
+    }
+
+    $f->major = $maj as int32;
+    $f->minor = $min as int32;
+
+    return .ok(true);
+}

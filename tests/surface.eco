@@ -1,0 +1,38 @@
+/**
+ * Spot-check the committed generated surface and prove table, load and
+ * wrapper agree on one entry point. Each test is a fresh process, so load
+ * cannot leak into the next one.
+ */
+
+private function sentinelGetError() : uint32
+{
+    return 0x1234;
+}
+
+private function fakeGetproc(ptr<const uint8> $name) : ptr<uint8>
+{
+    $s = str::from($name);
+
+    if ($s == 'glGetError') {
+        unsafe {
+            return &sentinelGetError as ptr<uint8>;
+        }
+    }
+
+    return null;
+}
+
+test constants
+{
+    assert(gl::DEPTH_TEST == 0x0B71);
+    assert(gl::TRIANGLES == 4);
+    assert(gl::COLOR_BUFFER_BIT == 0x4000);
+    assert(gl::INVALID_INDEX == 0xFFFFFFFF);
+    assert(gl::TIMEOUT_IGNORED == 0xFFFFFFFFFFFFFFFF);
+}
+
+test load_binds_get_error
+{
+    assert(gl::load(&fakeGetproc) == 1);
+    assert(gl::GetError() == 0x1234);
+}

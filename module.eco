@@ -1,0 +1,24 @@
+/*
+ * libopengl - OpenGL core-profile bindings for Echo.
+ *
+ * Generated from the Khronos registry. Nothing here is linked: every entry
+ * point is an address `gl::load` asks a getproc for, so the same module
+ * works on Darwin, Linux and Windows. A consumer adds it with epm and
+ * nothing else.
+ */
+
+#[module: "libopengl"]
+#[version: "0.1.0"]
+#[epm::license: "MIT"]
+#[epm::description: "OpenGL core-profile bindings generated from the Khronos registry"]
+
+#[sources: "src/*.eco"]
+
+#[target: exe { name: "generate", entry: "gen/main.eco" }] {
+    #[sources: "gen/*.eco"]
+}
+
+#[target: test] {
+    #[sources: "tests/*.eco"]
+    #[sources: "gen/*.eco"]
+}

@@ -1,0 +1,533 @@
+/**
+ * Emitters and the two naming functions.
+ *
+ * A line is interpolated, then appended. Interpolation-in-a-loop against the
+ * accumulating buffer is the documented O(n²) trap; `reserve` plus append of
+ * a finished line is the way out.
+ */
+
+namespace glgen::emit;
+
+use glgen::reg;
+use glgen::feat;
+use glgen::Error;
+
+internal const uint64 U32_MAX = 0xFFFFFFFF;
+
+public struct Banner
+{
+    public string $invocation;
+    public string $api;
+    public string $version;
+    public string $profile;
+    public array<string> $extensions;
+    public string $registrySha;
+
+    public constructor()
+    {
+        $this->invocation = '';
+        $this->api = '';
+        $this->version = '';
+        $this->profile = '';
+        $this->extensions = array<string>();
+        $this->registrySha = '';
+    }
+}
+
+public struct Emitted
+{
+    public string $source;
+    public usize $nEnums;
+    public usize $nCommands;
+    public usize $nStubs;
+
+    public constructor()
+    {
+        $this->source = '';
+        $this->nEnums = 0;
+        $this->nCommands = 0;
+        $this->nStubs = 0;
+    }
+}
+
+private struct Stub
+{
+    public string $ret;
+    public array<string> $params;
+
+    public constructor()
+    {
+        $this->ret = 'void';
+        $this->params = array<string>();
+    }
+}
+
+public function constName(const string& $gl) : result<string, Error>
+{
+    string $n = $gl;
+
+    if ($n->starts('GL_')) {
+        $n = $n->sub(3, $n->size() - 3);
+    }
+
+    return identAfterStrip($gl, $n, 'enum');
+}
+
+public function fnName(const string& $gl) : result<string, Error>
+{
+    string $n = $gl;
+
+    if ($n->starts('gl')) {
+        $n = $n->sub(2, $n->size() - 2);
+    }
+
+    return identAfterStrip($gl, $n, 'command');
+}
+
+public function paramName(const string& $raw, usize $index) : string
+{
+    if (isEchoIdent($raw) && $raw != 'this') {
+        return $raw;
+    }
+
+    return "p{$index}";
+}
+
+public function emitModule(const feat::Folded& $folded, const Banner& $banner) : result<Emitted, Error>
+{
+    $constFrom = ordered_map<string, string>();
+    $fnFrom = ordered_map<string, string>();
+    $echoConsts = array<string>();
+    $echoFns = array<string>();
+
+    usize $i = 0;
+
+    while ($i < $folded->enums->count()) {
+        $gl = $folded->enums[$i]->name;
+        $echo = guard constName($gl) else ($e) {
+            return .error($e);
+        }
+
+        if ($constFrom->has($echo)) {
+            return .error(.nameCollision('enum', $echo, $constFrom->get($echo), $gl));
+        }
+
+        $constFrom[$echo] = $gl;
+        $echoConsts[] = $echo;
+        $i = $i + 1;
+    }
+
+    $i = 0;
+
+    while ($i < $folded->commands->count()) {
+        $gl = $folded->commands[$i]->name;
+        $echo = guard fnName($gl) else ($e) {
+            return .error($e);
+        }
+
+        if ($fnFrom->has($echo)) {
+            return .error(.nameCollision('command', $echo, $fnFrom->get($echo), $gl));
+        }
+
+        $fnFrom[$echo] = $gl;
+        $echoFns[] = $echo;
+        $i = $i + 1;
+    }
+
+    $stubOf = ordered_map<string, usize>();
+    $stubs = array<Stub>();
+    $i = 0;
+
+    while ($i < $folded->commands->count()) {
+        $sig = sig($folded->commands[$i]);
+
+        if (!$stubOf->has($sig)) {
+            $s = Stub();
+            $s->ret = $folded->commands[$i]->retEcho;
+            usize $p = 0;
+
+            while ($p < $folded->commands[$i]->params->count()) {
+                $s->params[] = $folded->commands[$i]->params[$p]->echoType;
+                $p = $p + 1;
+            }
+
+            $stubOf[$sig] = $stubs->count();
+            $stubs[] = $s;
+        }
+
+        $i = $i + 1;
+    }
+
+    $out = Emitted();
+    $out->nEnums = $folded->enums->count();
+    $out->nCommands = $folded->commands->count();
+    $out->nStubs = $stubs->count();
+    $out->source->reserve(4194304);
+
+    banner($out->source, $banner);
+    $out->source->append("namespace gl;\n\n");
+
+    $consts = constants($out->source, $folded, $echoConsts);
+
+    if ($consts->failed()) {
+        return .error($consts->failure());
+    }
+
+    stubs($out->source, $stubs);
+    table($out->source, $folded, $echoFns, $stubOf);
+    state($out->source);
+    load($out->source, $folded, $echoFns);
+    glue($out->source);
+    wrappers($out->source, $folded, $echoFns);
+
+    return .ok($out);
+}
+
+private function identAfterStrip(const string& $gl, const string& $stripped, const string& $kind) : result<string, Error>
+{
+    string $n = $stripped;
+
+    if ($n->empty()) {
+        return .error(.emptyName($kind, $gl));
+    }
+
+    if (startsDigit($n)) {
+        $n = "_{$n}";
+    }
+
+    if (!isEchoIdent($n)) {
+        return .error(.nonIdent($kind, $gl, $n));
+    }
+
+    return .ok($n);
+}
+
+private function startsDigit(const string& $s) : bool
+{
+    if ($s->empty()) {
+        return false;
+    }
+
+    uint8 $b = $s->byte(0);
+
+    if ($b >= 48 && $b <= 57) {
+        return true;
+    }
+
+    return false;
+}
+
+private function isEchoIdent(const string& $s) : bool
+{
+    if ($s->empty()) {
+        return false;
+    }
+
+    uint8 $first = $s->byte(0);
+
+    if (!isIdentStart($first)) {
+        return false;
+    }
+
+    usize $i = 1;
+
+    while ($i < $s->size()) {
+        if (!isIdentChar($s->byte($i))) {
+            return false;
+        }
+
+        $i = $i + 1;
+    }
+
+    return true;
+}
+
+private function isIdentStart(uint8 $b) : bool
+{
+    if ($b >= 65 && $b <= 90) {
+        return true;
+    }
+
+    if ($b >= 97 && $b <= 122) {
+        return true;
+    }
+
+    if ($b == 95) {
+        return true;
+    }
+
+    return false;
+}
+
+private function isIdentChar(uint8 $b) : bool
+{
+    if (isIdentStart($b)) {
+        return true;
+    }
+
+    if ($b >= 48 && $b <= 57) {
+        return true;
+    }
+
+    return false;
+}
+
+private function sig(const reg::Command& $c) : string
+{
+    string $s = $c->retEcho;
+    $s->append('(');
+    usize $i = 0;
+
+    while ($i < $c->params->count()) {
+        if ($i > 0) {
+            $s->append(', ');
+        }
+
+        $s->append($c->params[$i]->echoType);
+        $i = $i + 1;
+    }
+
+    $s->append(')');
+
+    return $s;
+}
+
+private function externType(const string& $sig) : string
+{
+    return "extern function<{$sig}>";
+}
+
+private function hexLit(uint64 $v) : string
+{
+    return "0x{$v:X}";
+}
+
+private function banner(string& $out, const Banner& $b) : void
+{
+    $out->append("// Generated by libopengl generate. Do not edit.\n");
+    $line = "// {$b->invocation}\n";
+    $out->append($line);
+    $line = "// api={$b->api} version={$b->version} profile={$b->profile}\n";
+    $out->append($line);
+
+    $exts = '';
+    usize $i = 0;
+
+    while ($i < $b->extensions->count()) {
+        if ($i > 0) {
+            $exts->append(', ');
+        }
+
+        $exts->append($b->extensions[$i]);
+        $i = $i + 1;
+    }
+
+    if ($exts->empty()) {
+        $exts = '(none)';
+    }
+
+    $line = "// extensions: {$exts}\n";
+    $out->append($line);
+    $line = "// registry: {$b->registrySha}\n\n";
+    $out->append($line);
+}
+
+private function constants(string& $out, const feat::Folded& $folded, const array<string>& $echo) : result<bool, Error>
+{
+    usize $i = 0;
+
+    while ($i < $folded->enums->count()) {
+        $e = $folded->enums[$i];
+        $ull = $e->kind == 'ull';
+
+        if (!$ull && $e->value > U32_MAX) {
+            return .error(.enumTooWide($e->name, $e->value));
+        }
+
+        $ty = 'uint32';
+
+        if ($ull) {
+            $ty = 'uint64';
+        }
+
+        $hex = hexLit($e->value);
+        $line = "public const {$ty} {$echo[$i]} = {$hex};\n";
+        $out->append($line);
+        $i = $i + 1;
+    }
+
+    $out->append('\n');
+
+    return .ok(true);
+}
+
+private function stubs(string& $out, const array<Stub>& $stubs) : void
+{
+    usize $i = 0;
+
+    while ($i < $stubs->count()) {
+        $s = $stubs[$i];
+        $args = stubArgs($s);
+        $line = "private function __missing_{$i}({$args}) : {$s->ret}\n";
+        $out->append($line);
+        $out->append("{\n");
+        $out->append("    die('gl: entry point called before gl::load, or unavailable in this context');\n");
+        $out->append("}\n\n");
+        $i = $i + 1;
+    }
+}
+
+private function stubArgs(const Stub& $s) : string
+{
+    $args = '';
+    usize $i = 0;
+
+    while ($i < $s->params->count()) {
+        if ($i > 0) {
+            $args->append(', ');
+        }
+
+        $args->append($s->params[$i]);
+        $args->append(" $a{$i}");
+        $i = $i + 1;
+    }
+
+    return $args;
+}
+
+private function table(
+    string& $out,
+    const feat::Folded& $folded,
+    const array<string>& $echo,
+    const ordered_map<string, usize>& $stubOf
+) : void
+{
+    $out->append("public struct commands\n{\n");
+    usize $i = 0;
+
+    while ($i < $folded->commands->count()) {
+        $sig = sig($folded->commands[$i]);
+        $ty = externType($sig);
+        $line = "    public {$ty} ${$echo[$i]};\n";
+        $out->append($line);
+        $i = $i + 1;
+    }
+
+    $out->append('\n');
+    $out->append("    public constructor()\n");
+    $out->append("    {\n");
+    $i = 0;
+
+    while ($i < $folded->commands->count()) {
+        $sig = sig($folded->commands[$i]);
+        usize $stub = $stubOf->get($sig);
+        $line = "        $this->{$echo[$i]} = &__missing_{$stub};\n";
+        $out->append($line);
+        $i = $i + 1;
+    }
+
+    $out->append("    }\n");
+    $out->append("}\n\n");
+}
+
+private function state(string& $out) : void
+{
+    $out->append("public struct state\n");
+    $out->append("{\n");
+    $out->append("    public static commands $commands = commands();\n");
+    $out->append("}\n\n");
+}
+
+private function load(string& $out, const feat::Folded& $folded, const array<string>& $echo) : void
+{
+    $out->append("public function load(extern function<ptr<uint8>(ptr<const uint8>)> $getproc) : usize\n");
+    $out->append("{\n");
+    $out->append("    usize $n = 0;\n");
+    $out->append("    ptr<uint8> $p = null;\n");
+    $out->append("    string $nm = '';\n\n");
+
+    usize $i = 0;
+
+    while ($i < $folded->commands->count()) {
+        $gl = $folded->commands[$i]->name;
+        $sig = sig($folded->commands[$i]);
+        $ty = externType($sig);
+        $field = $echo[$i];
+        $line = "    $nm = '{$gl}';\n";
+        $out->append($line);
+        $out->append("    $p:$ = $getproc($nm->cstr());\n");
+        $out->append("    if ($p:$ != null) {\n");
+        $line = "        unsafe { state::$commands->{$field} = $p:$ as {$ty}; }\n";
+        $out->append($line);
+        $out->append("        $n = $n + 1;\n");
+        $out->append("    }\n\n");
+        $i = $i + 1;
+    }
+
+    $out->append("    return $n;\n");
+    $out->append("}\n\n");
+}
+
+private function glue(string& $out) : void
+{
+    $out->append("public function supports(const string& $name) : bool\n");
+    $out->append("{\n");
+    $out->append("    int32 $n = __getInt(state::$commands->GetIntegerv, __NUM_EXTENSIONS);\n");
+    $out->append("    return __extSupported(state::$commands->GetStringi, $n, $name);\n");
+    $out->append("}\n\n");
+    $out->append("public function versionMajor() : int32\n");
+    $out->append("{\n");
+    $out->append("    return __getInt(state::$commands->GetIntegerv, __MAJOR_VERSION);\n");
+    $out->append("}\n\n");
+    $out->append("public function versionMinor() : int32\n");
+    $out->append("{\n");
+    $out->append("    return __getInt(state::$commands->GetIntegerv, __MINOR_VERSION);\n");
+    $out->append("}\n\n");
+}
+
+private function wrappers(string& $out, const feat::Folded& $folded, const array<string>& $echo) : void
+{
+    usize $i = 0;
+
+    while ($i < $folded->commands->count()) {
+        $c = $folded->commands[$i];
+        $args = '';
+        $call = '';
+        usize $p = 0;
+        $used = map<string, bool>();
+
+        while ($p < $c->params->count()) {
+            $raw = paramName($c->params[$p]->cName, $p);
+
+            if ($used->has($raw)) {
+                $raw = "p{$p}";
+            }
+
+            $used[$raw] = true;
+
+            if ($p > 0) {
+                $args->append(', ');
+                $call->append(', ');
+            }
+
+            $args->append($c->params[$p]->echoType);
+            $args->append(" ${$raw}");
+            $call->append("${$raw}");
+            $p = $p + 1;
+        }
+
+        $name = $echo[$i];
+        $line = "#[inline]\npublic function {$name}({$args}) : {$c->retEcho}\n";
+        $out->append($line);
+        $out->append("{\n");
+        $line = "    state::$commands->{$name}({$call});\n";
+
+        if ($c->retEcho != 'void') {
+            $line = "    return state::$commands->{$name}({$call});\n";
+        }
+
+        $out->append($line);
+        $out->append("}\n\n");
+        $i = $i + 1;
+    }
+}
