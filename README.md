@@ -14,14 +14,17 @@ This is also not a window. You still need GLFW, SDL, or whatever you use to crea
 epm add echolang/libopengl --git https://github.com/echolang/libopengl --range ^0.1
 ```
 
-That is all. The `gl` namespace is there as soon as the module loads. Then you load the table, then you call it:
+That is all for the GL table. For a window and a context, add libglfw too:
+
+```bash
+epm add echolang/libglfw --git https://github.com/echolang/libglfw --range ^0.1
+```
+
+The `gl` namespace is there as soon as the module loads. After `glfw::makeContextCurrent`, you load the table, then you call it:
 
 ```echo
-extern {
-    function glfwGetProcAddress(ptr<const uint8> $name) : ptr<uint8>;
-}
-
-gl::load(&glfwGetProcAddress);
+glfw::makeContextCurrent($window);
+gl::load(&glfw::getProcAddress);
 gl::ClearColor(0.1, 0.1, 0.1, 1.0);
 gl::Clear(gl::COLOR_BUFFER_BIT);
 ```
@@ -35,7 +38,7 @@ That compiles. It dies at runtime if you call into it before `load`, or if you `
 `gl::load` takes a getproc and returns how many entry points resolved.
 
 ```echo
-usize $n = gl::load(&glfwGetProcAddress);
+usize $n = gl::load(&glfw::getProcAddress);
 ```
 
 A null from getproc leaves the die-stub that the table was constructed with. That is the whole of how a 4.1 macOS context is allowed to lack a 4.6 function: you hear about it when you call it, not when you load.
