@@ -9,6 +9,7 @@
 
 #[module: "libopengl"]
 #[version: "0.1.0"] // x-release-please-version
+#[epm::echoc: ">=0.14.0"]
 #[epm::license: "MIT"]
 #[epm::description: "OpenGL core-profile bindings generated from the Khronos registry"]
 

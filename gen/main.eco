@@ -152,7 +152,7 @@ if ($ver->failed()) {
     die($ver->failure()->message());
 }
 
-$xml = guard std::io::readfile($args->xml) else ($e) {
+$xml = guard std::fs::readfile($args->xml) else ($e) {
     die($e->message());
 }
 
@@ -177,7 +177,7 @@ $em = guard emit::emitModule($folded, $banner) else ($e) {
 }
 
 if ($args->check) {
-    $have = guard std::io::readfile($args->out) else ($e) {
+    $have = guard std::fs::readfile($args->out) else ($e) {
         die("{$args->out} is missing or unreadable ({$e->message()}); rerun generate");
     }
 
@@ -189,7 +189,7 @@ if ($args->check) {
     std::env::exit(0);
 }
 
-$wrote = std::io::writefile($args->out, $em->source);
+$wrote = std::fs::writefile($args->out, $em->source);
 
 if ($wrote->failed()) {
     die($wrote->failure()->message());
